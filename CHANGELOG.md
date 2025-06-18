@@ -52,6 +52,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Unquoted `*` is now allowed in revsets. `bookmarks(glob:foo*)` no longer
   needs quoting.
 
+* Changed Git representation of conflicted commits to include files from the
+  first side of the conflict. This should prevent unchanged files from being
+  highlighted as "added" in editors when checking out a conflicted commit in a
+  colocated workspace.
+
 ### Fixed bugs
 
 * `jj fix` now prints a warning if a tool failed to run on a file.
