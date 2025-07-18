@@ -15,6 +15,7 @@
 //! A lazily merged view of a set of trees.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::iter;
 use std::iter::zip;
 use std::pin::Pin;
@@ -28,20 +29,28 @@ use either::Either;
 use futures::Stream;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use futures::future::ready;
 use futures::future::try_join;
+use futures::future::try_join_all;
 use futures::stream::BoxStream;
+use futures::stream::FuturesOrdered;
 use itertools::EitherOrBoth;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
 
+use crate::backend::BackendError;
 use crate::backend::BackendResult;
+use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::MergedTreeId;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::copies::CopiesTreeDiffEntry;
 use crate::copies::CopiesTreeDiffStream;
+use crate::copies::CopyGraph;
 use crate::copies::CopyRecords;
+use crate::copies::is_descendant;
+use crate::copies::traverse_copy_history;
 use crate::matchers::EverythingMatcher;
 use crate::matchers::Matcher;
 use crate::merge::Diff;
@@ -49,6 +58,7 @@ use crate::merge::Merge;
 use crate::merge::MergeBuilder;
 use crate::merge::MergedTreeVal;
 use crate::merge::MergedTreeValue;
+use crate::merge::SameChange;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
@@ -320,6 +330,16 @@ impl MergedTree {
             other.clone(),
             copy_records,
         ))
+    }
+
+    /// Like `diff_stream()` but takes CopyHistory into account.
+    pub fn diff_stream_with_copy_history<'a>(
+        &'a self,
+        other: &'a Self,
+        matcher: &'a dyn Matcher,
+    ) -> BoxStream<'a, CopyHistoryTreeDiffEntry> {
+        let stream = self.diff_stream(other, matcher);
+        Box::pin(CopyHistoryDiffStream::new(stream, self, other))
     }
 
     /// Merges this tree with `other`, using `base` as base. Any conflicts will
@@ -961,6 +981,400 @@ impl Stream for DiffStreamForFileSystem<'_> {
         }
         Poll::Ready(self.held_file.take())
     }
+}
+
+/// Describes the source of a CopyHistoryDiffTerm
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CopyHistorySource {
+    /// The file was copied from a source at a different path
+    Copy(RepoPathBuf),
+    /// The file was renamed from a source at a different path
+    Rename(RepoPathBuf),
+    /// The source and target have the same path
+    Normal,
+}
+
+/// Describes a single term of a copy-aware diff
+#[derive(Debug, Eq, Hash, PartialEq)]
+pub struct CopyHistoryDiffTerm {
+    /// The current value of the target, if present
+    pub target_value: Option<TreeValue>,
+    /// List of sources, whether they were copied, renamed, or neither, and the
+    /// original value
+    pub sources: Vec<(CopyHistorySource, MergedTreeValue)>,
+}
+
+/// Like a `TreeDiffEntry`, but takes `CopyHistory`s into account
+#[derive(Debug)]
+pub struct CopyHistoryTreeDiffEntry {
+    /// The final source path (after copy/rename if applicable)
+    pub target_path: RepoPathBuf,
+    /// The resolved values for the target and source(s), if available
+    pub diffs: BackendResult<Merge<CopyHistoryDiffTerm>>,
+}
+
+impl CopyHistoryTreeDiffEntry {
+    // Simple conversion case where no copy detection is needed
+    fn simple(tde: TreeDiffEntry) -> Self {
+        let target_path = tde.path;
+        let diffs = tde.values.map(|diff| {
+            let sources = if diff.before.is_absent() {
+                vec![]
+            } else {
+                vec![(CopyHistorySource::Normal, diff.before)]
+            };
+            Merge::from_vec(
+                diff.after
+                    .into_iter()
+                    .map(|target_value| CopyHistoryDiffTerm {
+                        target_value,
+                        sources: sources.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        Self { target_path, diffs }
+    }
+}
+
+/// Adapts a `TreeDiffStream` to follow copies / renames.
+pub struct CopyHistoryDiffStream<'a> {
+    inner: Option<TreeDiffStream<'a>>,
+    before_tree: &'a MergedTree,
+    after_tree: &'a MergedTree,
+    pending: FuturesOrdered<BoxFuture<'a, CopyHistoryTreeDiffEntry>>,
+}
+
+impl<'a> CopyHistoryDiffStream<'a> {
+    /// Creates an iterator over the differences between two trees, taking copy
+    /// history into account. Generally prefer
+    /// `MergedTree::diff_stream_with_copy_history()` instead of calling this
+    /// directly.
+    pub fn new(
+        inner: TreeDiffStream<'a>,
+        before_tree: &'a MergedTree,
+        after_tree: &'a MergedTree,
+    ) -> Self {
+        Self {
+            inner: Some(inner),
+            before_tree,
+            after_tree,
+            pending: FuturesOrdered::new(),
+        }
+    }
+}
+
+impl Stream for CopyHistoryDiffStream<'_> {
+    type Item = CopyHistoryTreeDiffEntry;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // First, check if we have completed futures to return.
+            if !self.pending.is_empty()
+                && let Poll::Ready(Some(result)) = self.pending.poll_next_unpin(cx)
+            {
+                return Poll::Ready(Some(result));
+            }
+
+            // If we didn't have queued results above, we want to check our wrapped stream
+            // for the next result. However, the stream may have previously
+            // returned `Poll::Ready(None)`, in which case we're not supposed to
+            // poll it again. But we can't just blindly assume that we're done,
+            // because we may have pending copy-detection futures whose results are not
+            // ready yet.
+            let Some(next_tde) = (match self.inner.as_mut() {
+                Some(inner) => ready!(inner.as_mut().poll_next(cx)),
+                None => None,
+            }) else {
+                self.inner = None;
+                if self.pending.is_empty() {
+                    return Poll::Ready(None);
+                } else {
+                    return Poll::Pending;
+                }
+            };
+
+            let Ok(Diff { before, after }) = &next_tde.values else {
+                self.pending
+                    .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(next_tde))));
+                continue;
+            };
+
+            // Don't try copy-tracing if we have conflicts on either side.
+            //
+            // TODO: maybe we could make this work if the CopyIds resolve, even if the files
+            // themselves don't?
+            let Some(before) = before.as_resolved() else {
+                self.pending
+                    .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(next_tde))));
+                continue;
+            };
+            let Some(after) = after.as_resolved() else {
+                self.pending
+                    .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(next_tde))));
+                continue;
+            };
+
+            // Want to end up with before/after being None or Some(File)
+            let (before, after) = match (before, after) {
+                // If we have two Files with matching CopyIDs, we can skip copy-tracing
+                (
+                    Some(TreeValue::File { copy_id: copy1, .. }),
+                    Some(TreeValue::File { copy_id: copy2, .. }),
+                ) if copy1 == copy2 => {
+                    self.pending
+                        .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(next_tde))));
+                    continue;
+                }
+
+                // If we only have Files, then we'll do copy-tracing below.
+                (Some(TreeValue::File { .. }), None)
+                | (Some(TreeValue::File { .. }), Some(TreeValue::File { .. }))
+                | (None, Some(TreeValue::File { .. })) => (before, after),
+
+                // If we have a File on one side and something else on the other, we need to
+                // split the TreeDiffEntry into two; one with the copy-matched File, and the other
+                // with the non-File as added or deleted.
+                (Some(TreeValue::File { .. }), Some(other)) => {
+                    // We're changing a path from a File to something else. First, queue up a
+                    // DiffEntry for the "something else" and then look for renames for the File.
+                    self.pending
+                        .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(
+                            TreeDiffEntry {
+                                path: next_tde.path.clone(),
+                                values: Ok(Diff {
+                                    before: Merge::absent(),
+                                    after: Merge::resolved(Some(other.clone())),
+                                }),
+                            },
+                        ))));
+                    (before, &None)
+                }
+
+                (Some(other), Some(TreeValue::File { .. })) => {
+                    self.pending
+                        .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(
+                            TreeDiffEntry {
+                                path: next_tde.path.clone(),
+                                values: Ok(Diff {
+                                    before: Merge::resolved(Some(other.clone())),
+                                    after: Merge::absent(),
+                                }),
+                            },
+                        ))));
+                    (&None, after)
+                }
+
+                _ => {
+                    self.pending
+                        .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(next_tde))));
+                    continue;
+                }
+            };
+
+            // At this point, at least one of before/after is a TreeValue::File; if both are
+            // Files, we know they have different copy IDs. Match against
+            // ancestors/descendants in both directions, possibly creating two
+            // `DiffStreamEntry`s
+
+            // If we have a "before" file that didn't match at the same path in the "after"
+            // tree, then this is either a deletion or a rename. Renames will be
+            // detected by the "after" side of whatever descendant file matches
+            // via copy-tracking to this "before" file. Later on we'll want to suppress such
+            // deletion diffs, but for now let's just emit them all.
+            //
+            // TODO: implement deletion suppression
+            if let Some(f) = before {
+                self.pending
+                    .push_back(Box::pin(ready(CopyHistoryTreeDiffEntry::simple(
+                        TreeDiffEntry {
+                            path: next_tde.path.clone(),
+                            values: Ok(Diff {
+                                before: Merge::resolved(Some(f.clone())),
+                                after: Merge::absent(),
+                            }),
+                        },
+                    ))));
+            }
+
+            if let Some(f) = after {
+                let fut = Box::pin(tree_diff_entry_from_copies(
+                    self.before_tree.clone(),
+                    self.after_tree.clone(),
+                    f.clone(),
+                    next_tde.path,
+                ));
+                self.pending.push_back(fut);
+            }
+        }
+    }
+}
+
+async fn copy_or_rename(
+    tree: &MergedTree,
+    parent_path: RepoPathBuf,
+    parent_val: &TreeValue,
+    copy_graph: &CopyGraph,
+) -> BackendResult<CopyHistorySource> {
+    let before_id = parent_val.copy_id().expect("expected TreeValue::File");
+    let after_val = tree.path_value_async(&parent_path).await?;
+    // TODO: cleanup error handling?
+    //
+    // We're getting our arguments from `find_diff_sources_from_copies`, so we
+    // shouldn't have to worry about missing paths or conflicts. So let's just
+    // be lazy and `.expect()` our way out of all the `Option`s.
+    //
+    // TODO: try to come up with a test case where after_val is actually a Tree or
+    // Symlink or something
+    let after_id = after_val
+        .to_copy_id_merge()
+        .expect("expected merge of `TreeValue::File`s")
+        .resolve_trivial(SameChange::Accept)
+        .expect("expected no CopyId conflicts")
+        .clone()
+        // This may be absent, but we check for that later, so use a placeholder for now
+        //
+        // TODO: test case
+        .unwrap_or_else(CopyId::placeholder);
+
+    // Renames can come in three forms:
+    // 1) parent_path is no longer present in after_tree, or
+    // 2) parent_path in before_tree & after_tree are not ancestors/descendants of
+    //    each other
+    //
+    //    NB: for this case, a file with the same copy_id is considered to be an
+    //    ancestor of itself
+    if after_val.is_absent()
+        || !(is_descendant(copy_graph, &before_id, &after_id)
+            || is_descendant(copy_graph, &after_id, &before_id))
+    {
+        Ok(CopyHistorySource::Rename(parent_path))
+    } else {
+        Ok(CopyHistorySource::Copy(parent_path))
+    }
+}
+
+async fn tree_diff_entry_from_copies(
+    before_tree: MergedTree,
+    after_tree: MergedTree,
+    file: TreeValue,
+    target_path: RepoPathBuf,
+) -> CopyHistoryTreeDiffEntry {
+    CopyHistoryTreeDiffEntry {
+        target_path,
+        diffs: diffs_from_copies(before_tree, after_tree, file).await,
+    }
+}
+
+async fn diffs_from_copies(
+    before_tree: MergedTree,
+    after_tree: MergedTree,
+    file: TreeValue,
+) -> BackendResult<Merge<CopyHistoryDiffTerm>> {
+    let copy_id = file.copy_id().ok_or(BackendError::Other(
+        "Expected TreeValue::File with a CopyId".into(),
+    ))?;
+    let related_copies = before_tree
+        .store()
+        .backend()
+        .get_related_copies(&copy_id)
+        .await?;
+    let copy_graph: CopyGraph = related_copies.iter().cloned().collect();
+
+    let copies =
+        find_diff_sources_from_copies(&before_tree, &copy_id, &copy_graph, &related_copies).await?;
+
+    try_join_all(copies.into_iter().map(async |(path, val)| {
+        copy_or_rename(&after_tree, path, &val, &copy_graph)
+            .await
+            .map(|source| (source, Merge::resolved(Some(val))))
+    }))
+    .await
+    .map(|sources| {
+        Merge::resolved(CopyHistoryDiffTerm {
+            target_value: Some(file),
+            sources,
+        })
+    })
+}
+
+// Finds at most one related TreeValue::File present in `tree` per parent listed
+// in `file`'s CopyHistory.
+//
+// TODO: this is not guaranteed to be the "best" choice for any given parent.
+async fn find_diff_sources_from_copies(
+    tree: &MergedTree,
+    copy_id: &CopyId,
+    copy_graph: &CopyGraph,
+    related_copies: &Vec<(CopyId, CopyHistory)>,
+) -> BackendResult<Vec<(RepoPathBuf, TreeValue)>> {
+    // Related copies MUST contain ancestors AND descendants. It may also contain
+    // unrelated copies.
+    let history = copy_graph.get(copy_id).ok_or(BackendError::Other(
+        "CopyId should be present in `get_related_copies()` result".into(),
+    ))?;
+
+    let mut sources = vec![];
+
+    // TODO: I think this correctly finds the shallowest ancestor, but it only finds
+    // one. I'm not sure what is the best thing to do when one of our parents
+    // itself has multiple parents. E.g., if we have
+    //
+    //      D
+    //      |
+    //      C
+    //     / \
+    //    A   B
+    //
+    // where D is `file`, C is its parent but is not present in `tree`, but both A
+    // and B are present, this will find either A or B, not both. Should we
+    // return both A and B instead? I don't think there's a way to do that with
+    // the current dag_walk functions. Do we care enough to implement something
+    // new there that pays more attention to the depth in the DAG? Perhaps
+    // a variant of closest_common_node?
+    'parents: for parent_copy_id in &history.parents {
+        let mut seen_ancestors = HashSet::new();
+
+        // First, try to find the parent or a direct ancestor in the tree
+        for ancestor_id in traverse_copy_history(copy_graph, parent_copy_id) {
+            let ancestor_history = copy_graph.get(ancestor_id).ok_or(BackendError::Other(
+                "Ancestor CopyId should be present in `get_related_copies()` result".into(),
+            ))?;
+            if let Some(ancestor) = tree.copy_value(ancestor_id).await? {
+                sources.push((ancestor_history.current_path.clone(), ancestor));
+                continue 'parents;
+            } else {
+                seen_ancestors.insert(ancestor_id);
+            }
+        }
+
+        // If not, then try descendants of the parent
+        for (related_id, related_history) in related_copies {
+            if *related_id == *parent_copy_id {
+                break;
+            }
+            if is_descendant(copy_graph, parent_copy_id, related_id)
+                && let Some(relative) = tree.copy_value(related_id).await?
+            {
+                sources.push((related_history.current_path.clone(), relative));
+                continue 'parents;
+            }
+        }
+
+        // Finally, try descendants of any ancestor
+        for (related_id, related_history) in related_copies {
+            for ancestor_id in &seen_ancestors {
+                if is_descendant(copy_graph, ancestor_id, related_id)
+                    && let Some(relative) = tree.copy_value(related_id).await?
+                {
+                    sources.push((related_history.current_path.clone(), relative));
+                    continue 'parents;
+                }
+            }
+        }
+    }
+
+    Ok(sources)
 }
 
 /// Helper for writing trees with conflicts.
