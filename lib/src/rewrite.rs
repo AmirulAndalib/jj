@@ -1292,6 +1292,7 @@ pub fn find_duplicate_divergent_commits(
                 .resolve_change_id(target_commit.change_id())
                 // TODO: indexing error shouldn't be a "BackendError"
                 .map_err(|err| BackendError::Other(err.into()))?
+                .map(|resolved| resolved.visible)
                 .unwrap_or_default();
             ancestor_candidates.retain(|commit_id| !target_commit_ids.contains(commit_id));
             Ok((target_commit, ancestor_candidates))

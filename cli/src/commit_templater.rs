@@ -1151,7 +1151,7 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
             let out_property = self_property.and_then(|commit| {
                 // The given commit could be hidden in e.g. `jj evolog`.
                 let maybe_entries = repo.resolve_change_id(commit.change_id())?;
-                let divergent = maybe_entries.map_or(0, |entries| entries.len()) > 1;
+                let divergent = maybe_entries.map_or(0, |entries| entries.visible.len()) > 1;
                 Ok(divergent)
             });
             Ok(out_property.into_dyn_wrapped())

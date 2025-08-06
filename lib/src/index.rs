@@ -196,13 +196,62 @@ impl dyn MutableIndex {
     }
 }
 
+/// Represents the possible target commits of a resolved change ID. If the
+/// commit is divergent, there may be multiple visible commits. Hidden commits
+/// are also returned to allow showing a change generation number in the evolog.
+#[derive(Clone, Debug)]
+pub struct ResolvedChangeId {
+    /// All visible commits with this change ID. If supported by the index, the
+    /// commits should be sorted from most to least recent.
+    pub visible: Vec<CommitId>,
+    /// Hidden commits with this change ID. If this cannot be implemented
+    /// efficiently, the index implementation is free to leave this empty. If
+    /// non-empty, the commits should be sorted from most to least recent.
+    pub hidden: Vec<CommitId>,
+}
+
+impl ResolvedChangeId {
+    /// Extracts the visible commits from this `ResolvedChangeId`. Returns
+    /// `None` if there are no visible commits with this change ID.
+    pub fn into_visible(self) -> Option<Vec<CommitId>> {
+        if self.visible.is_empty() {
+            None
+        } else {
+            Some(self.visible)
+        }
+    }
+
+    /// Returns the commit ID at a generation number. The generation number of
+    /// a commit can be found using [`ResolvedChangeId::find_generation`].
+    pub fn at_generation(&self, generation: u32) -> Option<&CommitId> {
+        self.visible
+            .get(generation as usize)
+            .or_else(|| self.hidden.get(generation as usize - self.visible.len()))
+    }
+
+    /// Finds the change generation number corresponding to a commit. Visible
+    /// commits have a generation number lower than hidden commits. Newer
+    /// commits should generally have a lower generation number than older
+    /// commits (when supported by the index implementation).
+    pub fn find_generation(&self, commit_id: &CommitId) -> Option<u32> {
+        self.visible
+            .iter()
+            .chain(&self.hidden)
+            .position(|visible_id| visible_id == commit_id)
+            .map(|generation| {
+                generation
+                    .try_into()
+                    .expect("should be fewer than u32::MAX commits with a change ID")
+            })
+    }
+}
+
 /// Defines the interface for types that provide an index of the commits in a
 /// repository by [`ChangeId`].
 pub trait ChangeIdIndex: Send + Sync {
     /// Resolve an unambiguous change ID prefix to the commit IDs in the index.
-    ///
-    /// The order of the returned commit IDs is unspecified.
-    fn resolve_prefix(&self, prefix: &HexPrefix) -> IndexResult<PrefixResolution<Vec<CommitId>>>;
+    fn resolve_prefix(&self, prefix: &HexPrefix)
+    -> IndexResult<PrefixResolution<ResolvedChangeId>>;
 
     /// This function returns the shortest length of a prefix of `key` that
     /// disambiguates it from every other key in the index.
