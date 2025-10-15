@@ -62,6 +62,7 @@ struct UserSettingsData {
 
 #[derive(Debug, Clone)]
 pub struct GitSettings {
+    // TODO: Delete in jj 0.42.0+
     pub auto_local_bookmark: bool,
     pub abandon_unreachable_commits: bool,
     pub executable_path: PathBuf,
@@ -73,7 +74,9 @@ pub struct GitSettings {
 impl GitSettings {
     pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
         Ok(Self {
-            auto_local_bookmark: settings.get_bool("git.auto-local-bookmark")?,
+            auto_local_bookmark: settings
+                .get_bool("git.auto-local-bookmark")
+                .unwrap_or_default(),
             abandon_unreachable_commits: settings.get_bool("git.abandon-unreachable-commits")?,
             executable_path: settings.get("git.executable-path")?,
             write_change_id_header: settings.get("git.write-change-id-header")?,

@@ -2114,8 +2114,8 @@ fn test_import_export_non_tracking_bookmark() {
         RefTarget::absent()
     );
 
-    // Reimport with auto-track-bookmarks on. Local bookmark shouldn't be created for
-    // the known bookmark "main".
+    // Reimport with auto-track-bookmarks on. Local bookmark shouldn't be created
+    // for the known bookmark "main".
     let commit_main_t1 = empty_git_commit(&git_repo, "refs/remotes/origin/main", &[commit_main_t0]);
     let commit_feat_t1 = empty_git_commit(&git_repo, "refs/remotes/origin/feat", &[]);
     git_settings.remotes = auto_track_all();
