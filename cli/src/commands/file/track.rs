@@ -43,6 +43,14 @@ pub(crate) struct FileTrackArgs {
     /// Paths to track
     #[arg(required = true, value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
+
+    /// Track paths even if they're ignored or too large
+    ///
+    /// By default, `jj file track` will not track files that are ignored by
+    /// .gitignore or exceed the maximum file size. This flag overrides those
+    /// restrictions, explicitly tracking the specified files.
+    #[arg(long)]
+    include_ignored: bool,
 }
 
 #[instrument(skip_all)]
@@ -55,7 +63,11 @@ pub(crate) fn cmd_file_track(
     let matcher = workspace_command
         .parse_file_patterns(ui, &args.paths)?
         .to_matcher();
-    let options = workspace_command.snapshot_options_with_start_tracking_matcher(&matcher)?;
+
+    let mut options = workspace_command.snapshot_options_with_start_tracking_matcher(&matcher)?;
+    if args.include_ignored {
+        options.force_tracking_matcher = &matcher;
+    }
 
     let mut tx = workspace_command.start_transaction().into_inner();
     let (mut locked_ws, _wc_commit) = workspace_command.start_working_copy_mutation()?;
@@ -72,6 +84,7 @@ pub(crate) fn cmd_file_track(
         track_stats,
         workspace_command.env().path_converter(),
     )?;
+
     Ok(())
 }
 
