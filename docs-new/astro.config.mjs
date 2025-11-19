@@ -6,12 +6,30 @@ import starlight from "@astrojs/starlight";
 export default defineConfig({
 	integrations: [
 		starlight({
-			title: "My Docs",
-			social: [{
-				icon: "github",
-				label: "GitHub",
-				href: "https://github.com/withastro/starlight",
-			}],
+			title: "Jujutsu docs",
+			logo: {
+				src: "./src/assets/jj-logo.svg",
+			},
+			tableOfContents: {
+				minHeadingLevel: 2,
+				maxHeadingLevel: 4,
+			},
+			editLink: {
+				baseUrl: "https://github.com/jj-vcs/jj/edit/main/docs-new",
+			},
+			social: [
+				{
+					icon: "github",
+					label: "GitHub",
+					href: "https://github.com/withastro/starlight",
+				},
+				{
+					icon: "discord",
+					label: "Discord",
+					href: "https://discord.gg/dkmfj3aGQN",
+				},
+			],
+			credits: true, // TODO: remove? I personally like this info as a site visitor.
 			sidebar: [
 				{
 					label: "Guides",
